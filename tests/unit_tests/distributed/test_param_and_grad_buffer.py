@@ -87,7 +87,9 @@ def get_model_and_buffers(
         full_param_layout = DistributedOptimizer.compute_full_param_layout(
             all_params,
             bucket_size,
-            parallel_state.get_data_parallel_world_size(partial_data_parallel=True),
+            parallel_state.get_data_parallel_world_size(
+                with_context_parallel=True, partial_data_parallel=True
+            ),
             ddp_config,
         )
     model = DistributedDataParallel(
