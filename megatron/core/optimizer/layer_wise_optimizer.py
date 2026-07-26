@@ -701,9 +701,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     if not _bucket_is_managed_by_layer_wise_optimizer(bucket):
                         continue
                     if self.dp_cp_params_list is not None:
-                        bucket_params_list = [
-                            [] for _ in range(get_pg_size(self.dp_cp))
-                        ]
+                        bucket_params_list = [[] for _ in range(get_pg_size(self.dp_cp))]
                         for bucket_list, full_params_list in zip(
                             bucket_params_list, self.dp_cp_params_list
                         ):
@@ -721,9 +719,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     if not _bucket_is_managed_by_layer_wise_optimizer(bucket):
                         continue
                     if self.expt_dp_params_list is not None:
-                        bucket_params_list = [
-                            [] for _ in range(get_pg_size(self.expt_dp))
-                        ]
+                        bucket_params_list = [[] for _ in range(get_pg_size(self.expt_dp))]
                         for bucket_list, full_params_list in zip(
                             bucket_params_list, self.expt_dp_params_list
                         ):

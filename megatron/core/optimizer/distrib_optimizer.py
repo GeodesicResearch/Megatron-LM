@@ -217,9 +217,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # trailing shards of every bucket belong to no rank: those params are never updated and
         # drop out of grad-norm, num-zeros and params-norm, which sum over owned shards only.
         num_optimizer_shards = param_and_grad_buffer.num_optimizer_shards
-        assert (
-            num_optimizer_shards is None or num_optimizer_shards == data_parallel_world_size
-        ), (
+        assert num_optimizer_shards is None or num_optimizer_shards == data_parallel_world_size, (
             f"Parameter layout was built for {num_optimizer_shards} optimizer shards but the "
             f"buffer's data-parallel group has {data_parallel_world_size} ranks. Size the layout "
             f"by the group the optimizer shards over."
