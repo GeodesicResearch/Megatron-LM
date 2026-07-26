@@ -455,7 +455,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         # LayerWise assigns whole params to ranks of the full dp_cp group and all-gathers over
         # that same group, so it has no notion of optimizer instances. With more than one
-        # instance DDP reduce-scatters gradients over the smaller intra-instance group, so a
+        # instance, DDP reduce-scatters gradients over the smaller intra-instance group, so a
         # rank would be asked to update params whose gradients it does not hold. Reject the
         # combination instead of silently training on partial gradients.
         intra_dp_cp = (
