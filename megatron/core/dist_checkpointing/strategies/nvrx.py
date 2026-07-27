@@ -41,9 +41,21 @@ def has_nvrx_async_support() -> bool:
         getattr(state_dict_saver, "save_state_dict_async_finalize", None),
         getattr(state_dict_saver, "save_state_dict_async_plan", None),
     )
-    assert (
-        is_nvrx_min_version()
-    ), f"Minimum required nvidia-resiliency-ext package version is {NVRX_MIN_VERSION}."
+    # Geodesic/Isambard: a version below the async-checkpointing minimum must mean
+    # "async support unavailable", not a crash at import time. This helper runs at
+    # MODULE SCOPE of strategies/torch.py (HAVE_NVRX = has_nvrx_async_support()), which
+    # sits on the import path of megatron.core.dist_checkpointing and therefore of
+    # essentially everything. With nvidia-resiliency-ext 0.4.1 in the frozen NGC image
+    # BOTH failure modes are real: the original bare `assert is_nvrx_min_version()`
+    # raised AssertionError, and is_nvrx_min_version() itself raises AttributeError
+    # first — 0.4.1 is a namespace package with no __version__ attribute. We never
+    # enable async_save, so False is the correct capability answer either way,
+    # matching how the import failures just above are handled.
+    try:
+        if not is_nvrx_min_version():
+            return False
+    except Exception:
+        return False
 
     return all(symbol is not None for symbol in required_symbols) and hasattr(
         filesystem_async, "_results_queue"
