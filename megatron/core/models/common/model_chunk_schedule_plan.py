@@ -123,13 +123,14 @@ class TransformerLayerSchedulePlan:
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 
         fwd_callables, bwd_dw_callable_map = build_layer_callables(self.layer)
-        is_moe, num_local_experts = get_layer_moe_metadata(self.layer)
+        is_moe, num_local_experts, experts_quantize_input = get_layer_moe_metadata(self.layer)
 
         is_mtp = isinstance(self.layer, MultiTokenPredictionLayer)
 
         extra_args["config"] = self.layer.config
         extra_args["is_moe"] = is_moe
         extra_args["num_local_experts"] = num_local_experts
+        extra_args["experts_quantize_input"] = experts_quantize_input
         extra_args["delay_wgrad_compute"] = self.layer.config.delay_wgrad_compute
         extra_args["is_mtp"] = is_mtp
 

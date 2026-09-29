@@ -42,7 +42,7 @@ def weak_method(method):
 
 
 @internal_api
-def should_free_input(name, is_moe, config, num_local_experts):
+def should_free_input(name, is_moe, config, num_local_experts, experts_quantize_input):
     """Whether the schedule node named ``name`` can free its input after forward.
 
     The schedule decomposes a transformer layer into ``pre_dispatch_computation``,
@@ -57,6 +57,9 @@ def should_free_input(name, is_moe, config, num_local_experts):
         is_moe: True for MoE layers; dense layers always retain inputs.
         config: ``TransformerConfig`` for the layer.
         num_local_experts: Local expert count on this rank (None for dense).
+        experts_quantize_input: For MoE layers, whether the routed experts keep only a
+            quantized copy of their input under an FP8/FP4 recipe (see
+            ``fine_grained_callables.experts_quantize_input``); None for dense layers.
 
     Returns:
         True iff the named node may free its input after forward.
@@ -65,6 +68,11 @@ def should_free_input(name, is_moe, config, num_local_experts):
     # during backward pass
     if not is_moe:
         return False
+    if not isinstance(experts_quantize_input, bool):
+        raise TypeError(
+            "should_free_input needs experts_quantize_input (a bool) for MoE layers, "
+            f"got {experts_quantize_input!r}"
+        )
     enable_deepep = (
         config.moe_token_dispatcher_type == "flex"
         and config.moe_flex_dispatcher_backend == "deepep"
@@ -83,9 +91,11 @@ def should_free_input(name, is_moe, config, num_local_experts):
     # The input and output of A2A are not needed anymore after the forward pass,
     # so we can free the input memory after the forward pass.
 
-    # When low precision fp8/4 is enabled, the casted tensors are saved and the
-    # original bf16 tensors are safe to be freed.
-    free_mlp = config.fp8 is not None or config.fp4 is not None
+    # When low precision fp8/4 is enabled and the experts save the casted tensors, the
+    # original bf16 tensors are safe to be freed. [Geodesic adaptation] Experts that run
+    # their GEMMs outside TE stay BF16 under an FP8 recipe and save their input itself, so
+    # for them the rule below applies whatever the recipe.
+    free_mlp = experts_quantize_input and (config.fp8 is not None or config.fp4 is not None)
     if not free_mlp:
         # AlltoAll dispatcher with local_num_experts=1, HybridEP, and NCCL EP all use
         # identity operation for `dispatch_postprocess`, hence the mlp inputs will be
@@ -242,7 +252,9 @@ class TransformerLayerNode(ScheduleNode):
         assert config is not None, "model config must be passed to TransformerLayerNode."
         is_moe = extra_args.get("is_moe", False)
         num_local_experts = extra_args.get("num_local_experts", None)
-        free_input = self._resolve_free_input(name, is_moe, config, num_local_experts)
+        free_input = self._resolve_free_input(
+            name, is_moe, config, num_local_experts, extra_args["experts_quantize_input"]
+        )
         self.delay_wgrad_compute = extra_args.get("delay_wgrad_compute", False)
 
         super().__init__(
@@ -277,9 +289,9 @@ class TransformerLayerNode(ScheduleNode):
             )
 
     @staticmethod
-    def _resolve_free_input(name, is_moe, config, num_local_experts):
+    def _resolve_free_input(name, is_moe, config, num_local_experts, experts_quantize_input):
         """Free-input policy hook. Subclasses override to specialize."""
-        return should_free_input(name, is_moe, config, num_local_experts)
+        return should_free_input(name, is_moe, config, num_local_experts, experts_quantize_input)
 
     def detach(self, t):
         """Detach a tensor and remember it for backward through the schedule node."""

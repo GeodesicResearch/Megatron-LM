@@ -139,7 +139,7 @@ def test_mtp_pre_dispatch_applies_hybrid_empty_decoder_final_norm(monkeypatch):
             return hidden_states
 
     monkeypatch.setattr(common_callables, "build_layer_callables", fake_build_layer_callables)
-    monkeypatch.setattr(common_callables, "get_layer_moe_metadata", lambda _layer: (True, 1))
+    monkeypatch.setattr(common_callables, "get_layer_moe_metadata", lambda _layer: (True, 1, True))
     monkeypatch.setattr(common_callables, "get_mtp_layer_offset", lambda _config, _vp_stage: 0)
 
     model = HybridModel.__new__(HybridModel)

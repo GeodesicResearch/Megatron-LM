@@ -308,6 +308,60 @@ def build_gpt_model(config, vocab_size=512, max_seq_len=300):
     return model
 
 
+def build_hybrid_config(hybrid_layer_pattern, extra_kwargs=None):
+    """TransformerConfig for an 8-expert HybridModel on EP=4 that the EP overlap schedule
+    accepts; ``extra_kwargs`` adds further config fields."""
+    from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_pattern
+    from megatron.core.transformer import TransformerConfig
+
+    extra_kwargs = dict(extra_kwargs or {})
+    # HybridModel derives effective num_layers from the pattern; we still pass the flattened
+    # main-decoder count (MTP depths excluded) so TransformerConfig.__post_init__ checks pass.
+    main_pattern = parse_hybrid_pattern(hybrid_layer_pattern).main_pattern
+    flat = main_pattern.replace("[", "").replace("]", "")
+    return TransformerConfig(
+        # ``deterministic_mode`` sets ``NVTE_FUSED_ATTN=0`` for reproducibility; the default
+        # attention backend ``auto`` asserts that env is unset, so pin it to ``unfused`` like
+        # the GPT-side a2a_overlap tests do.
+        attention_backend="unfused",
+        pipeline_model_parallel_size=1,
+        expert_model_parallel_size=4,
+        deterministic_mode=True,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+        num_layers=len(flat),
+        hidden_size=512,
+        num_attention_heads=8,
+        num_query_groups=8,
+        ffn_hidden_size=512,
+        kv_channels=64,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        add_bias_linear=False,
+        num_moe_experts=8,
+        moe_grouped_gemm=True,
+        moe_router_dtype="fp32",
+        **extra_kwargs,
+    )
+
+
+def build_hybrid_model(config, hybrid_layer_pattern, vocab_size, max_sequence_length):
+    """Build and return a HybridModel on CUDA from the given config and layer pattern."""
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+
+    return HybridModel(
+        config=config,
+        hybrid_stack_spec=hybrid_stack_spec,
+        vocab_size=vocab_size,
+        max_sequence_length=max_sequence_length,
+        hybrid_layer_pattern=hybrid_layer_pattern,
+        pre_process=True,
+        post_process=True,
+    ).cuda()
+
+
 def build_input_data(seq_len=128, vocab_size=512):
     """Build fixed input data for the model."""
     return {

@@ -35,7 +35,7 @@ def build_mtp_layer_callables(layer):
     """
 
     forward_funcs, backward_dw = build_layer_callables(layer.mtp_model_layer)
-    is_moe, _ = get_layer_moe_metadata(layer.mtp_model_layer)
+    is_moe, _, _ = get_layer_moe_metadata(layer.mtp_model_layer)
     (pre_dispatch_forward, dispatch_forward, mlp_forward, combine_forward, _) = forward_funcs
     assert is_moe, "MTP layer in a2a overlap only supports MoE layer for now."
 
@@ -64,8 +64,27 @@ def build_mtp_layer_callables(layer):
                     )
 
             offset = get_mtp_layer_offset(layer.config, node.chunk_state.model.vp_stage)
-            node.chunk_state.mtp_hidden_states = list(torch.chunk(hidden_states, 1 + offset, dim=0))
-            hidden_states = node.chunk_state.mtp_hidden_states[offset]
+            chunks = list(torch.chunk(hidden_states, 1 + offset, dim=0))
+            # Store DETACHED chunks in chunk_state. mtp_hidden_states is a
+            # ``chunk_state``-level Python list that crosses slot boundaries
+            # (set here in MTP's pre_dispatch slot, later torch.cat'd in MTP's
+            # mtp_post_process slot before feeding the LM head). Without an
+            # explicit detach the chunks keep their grad_fn from torch.chunk →
+            # whatever upstream node produced ``hidden_states`` (e.g. the
+            # final_norm we apply above for the HybridModel empty-decoder case),
+            # which means mtp_post_process.backward and pre_dispatch.backward
+            # both traverse that same grad_fn — for a TENorm-backed final_norm
+            # (an OpFuser op) the second traversal hits ``ctx.tensor_objects is
+            # None`` and raises ``ctx must have .tensor_objects to restore
+            # saved tensors``. Using ``node.detach`` records the originals in
+            # before_detached so pre_dispatch's backward_impl still pulls the
+            # LM-head-side grad (accumulated on the detached leaves by the
+            # post_process / mtp_post_process backward chain) back into the
+            # outputs+before_detached run_backward — i.e. the gradient flow
+            # remains mathematically equivalent, just no longer shared across
+            # slots.
+            node.chunk_state.mtp_hidden_states = [node.detach(c) for c in chunks]
+            hidden_states = chunks[offset]
 
         input_ids, position_ids, padding_mask, decoder_input, hidden_states = layer._get_embeddings(
             input_ids=node.chunk_state.input_ids,
@@ -142,15 +161,40 @@ def build_mtp_layer_callables(layer):
     return forward_funcs, backward_dw
 
 
+def experts_quantize_input(moe_layer: TransformerLayer) -> bool:
+    """Whether ``moe_layer``'s routed experts keep only a quantized copy of their input.
+
+    [Geodesic adaptation, not in upstream #4798.] Read by ``should_free_input``.
+    Under an FP8/FP4 recipe, TEGroupedMLP saves the cast of its input for backward, so the
+    schedule may free the input itself. Experts that run their GEMMs outside TE (for example
+    Megatron-Bridge's ``GroupedExperts`` on ``torch._grouped_mm``) stay BF16 under such a recipe
+    and save the tensor they are given; freeing it corrupts their weight gradient (``setStorage
+    ... out of bounds for storage of size 0`` in the mlp backward). Only TEGroupedMLP is known
+    to quantize; anything else is treated as saving its input, which costs memory if wrong,
+    never correctness.
+    """
+    from megatron.core.transformer.moe.experts import TEGroupedMLP
+
+    return isinstance(moe_layer.mlp.experts, TEGroupedMLP)
+
+
 def get_layer_moe_metadata(layer):
-    """Return ``(is_moe, num_local_experts)`` for schedule-node construction."""
+    """Return ``(is_moe, num_local_experts, experts_quantize_input)`` for schedule-node construction.
+
+    ``num_local_experts`` and ``experts_quantize_input`` are None for dense layers.
+    """
+    from megatron.core.models.hybrid.hybrid_block import HybridStack
 
     if isinstance(layer, MultiTokenPredictionLayer):
         return get_layer_moe_metadata(layer.mtp_model_layer)
+    if isinstance(layer, HybridStack):
+        from megatron.core.models.hybrid.fine_grained_callables import get_hybrid_stack_moe_metadata
+
+        return get_hybrid_stack_moe_metadata(layer)
     if isinstance(layer, TransformerLayer):
-        is_moe = isinstance(layer.mlp, MoELayer)
-        num_local_experts = layer.mlp.num_local_experts if is_moe else None
-        return is_moe, num_local_experts
+        if not isinstance(layer.mlp, MoELayer):
+            return False, None, None
+        return True, layer.mlp.num_local_experts, experts_quantize_input(layer)
 
     raise ValueError(f"Unsupported layer type: {type(layer)}")
 
@@ -160,9 +204,15 @@ def build_layer_callables(layer):
 
     Returns ``(forward_funcs, backward_dw)``.
     """
+    from megatron.core.models.hybrid.hybrid_block import HybridStack
 
     if isinstance(layer, MultiTokenPredictionLayer):
         return build_mtp_layer_callables(layer)
+    if isinstance(layer, HybridStack):
+        from megatron.core.models.hybrid.fine_grained_callables import build_hybrid_stack_callables
+
+        forward_funcs, backward_dw, *_ = build_hybrid_stack_callables(layer)
+        return forward_funcs, backward_dw
     if isinstance(layer, TransformerLayer):
         return build_transformer_layer_callables(layer)
 

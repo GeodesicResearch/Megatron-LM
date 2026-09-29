@@ -23,10 +23,189 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel, _hybrid_loggin
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
+
+
+def _make_postprocess_stub(config, training):
+    """Build the minimal model surface needed by ``HybridModel._postprocess``."""
+
+    def output_layer(hidden_states, weight=None, runtime_gather_output=None):
+        return hidden_states, None
+
+    output_layer.sequence_parallel = False
+    pg_collection = SimpleNamespace(cp=object(), tp=object())
+    return SimpleNamespace(
+        config=config,
+        training=training,
+        post_process=True,
+        mtp_process=True,
+        share_embeddings_and_output_weights=False,
+        output_layer=output_layer,
+        pg_collection=pg_collection,
+        tp_group=pg_collection.tp,
+        _scale_logits=lambda logits: logits,
+        compute_language_model_loss=lambda labels, logits: logits,
+    )
+
+
+@pytest.mark.parametrize(
+    "cuda_graph_scope", [InferenceCudaGraphScope.none, InferenceCudaGraphScope.block]
+)
+def test_hybrid_postprocess_caches_spec_decode_hidden_states(cuda_graph_scope):
+    """Speculative decoding publishes decoder states through the inference context."""
+    hidden_states = torch.randn(3, 2, 8)
+    context_buffer = (
+        torch.full((5, 2, 8), -1.0) if cuda_graph_scope == InferenceCudaGraphScope.block else None
+    )
+    inference_context = SimpleNamespace(
+        config=SimpleNamespace(materialize_only_last_token_logits=False),
+        num_speculative_tokens=1,
+        mtp_decoder_hidden_states=context_buffer,
+        is_dynamic_batching=lambda: True,
+        is_static_batching=lambda: False,
+    )
+    model = _make_postprocess_stub(
+        SimpleNamespace(
+            mtp_num_layers=1, inference_cuda_graph_scope=cuda_graph_scope, use_mup=False
+        ),
+        training=False,
+    )
+
+    with InferenceMode.active():
+        output = HybridModel._postprocess(
+            model,
+            hidden_states=hidden_states,
+            input_ids=torch.zeros(2, 3, dtype=torch.long),
+            position_ids=torch.zeros(2, 3, dtype=torch.long),
+            labels=None,
+            rotary_pos_emb=None,
+            mtp_in_postprocess=False,
+            runtime_gather_output=True,
+            inference_context=inference_context,
+        )
+
+    torch.testing.assert_close(output, hidden_states.transpose(0, 1), rtol=0, atol=0)
+    if cuda_graph_scope == InferenceCudaGraphScope.block:
+        assert inference_context.mtp_decoder_hidden_states is context_buffer
+        torch.testing.assert_close(context_buffer[:3], hidden_states, rtol=0, atol=0)
+        assert torch.all(context_buffer[3:] == -1)
+    else:
+        assert inference_context.mtp_decoder_hidden_states is hidden_states
+    assert not hasattr(model, "_decoder_hidden_states_cache")
+
+
+def test_hybrid_postprocess_does_not_cache_regular_inference_hidden_states():
+    """Regular inference must not make the controller run serial MTP decoding."""
+    hidden_states = torch.randn(3, 2, 8)
+    inference_context = SimpleNamespace(
+        config=SimpleNamespace(materialize_only_last_token_logits=False),
+        num_speculative_tokens=0,
+        mtp_decoder_hidden_states=None,
+        is_dynamic_batching=lambda: True,
+        is_static_batching=lambda: False,
+    )
+    model = _make_postprocess_stub(
+        SimpleNamespace(
+            mtp_num_layers=1, inference_cuda_graph_scope=InferenceCudaGraphScope.none, use_mup=False
+        ),
+        training=False,
+    )
+
+    with InferenceMode.active():
+        HybridModel._postprocess(
+            model,
+            hidden_states=hidden_states,
+            input_ids=torch.zeros(2, 3, dtype=torch.long),
+            position_ids=torch.zeros(2, 3, dtype=torch.long),
+            labels=None,
+            rotary_pos_emb=None,
+            mtp_in_postprocess=False,
+            runtime_gather_output=True,
+            inference_context=inference_context,
+        )
+
+    assert inference_context.mtp_decoder_hidden_states is None
+    assert not hasattr(model, "_decoder_hidden_states_cache")
+
+
+def test_hybrid_postprocess_forwards_rl_mtp_inputs(monkeypatch):
+    """RL MTP loss receives token IDs and the TP group needed to derive labels."""
+    captured_kwargs = {}
+
+    def fake_process_mtp_loss(**kwargs):
+        captured_kwargs.update(kwargs)
+        return kwargs["hidden_states"][:2]
+
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_model.process_mtp_loss", fake_process_mtp_loss
+    )
+    model = _make_postprocess_stub(
+        SimpleNamespace(
+            mtp_num_layers=1, inference_cuda_graph_scope=InferenceCudaGraphScope.none, use_mup=False
+        ),
+        training=True,
+    )
+    input_ids = torch.arange(4, dtype=torch.long).reshape(1, 4)
+
+    HybridModel._postprocess(
+        model,
+        hidden_states=torch.randn(4, 1, 8),
+        input_ids=input_ids,
+        position_ids=torch.arange(4, dtype=torch.long).reshape(1, 4),
+        labels=None,
+        rotary_pos_emb=None,
+        mtp_in_postprocess=False,
+        runtime_gather_output=False,
+        inference_context=None,
+    )
+
+    assert captured_kwargs["input_ids"] is input_ids
+    assert captured_kwargs["tp_group"] is model.tp_group
+
+
+def test_hybrid_postprocess_uses_output_processor_hook():
+    """A caller-supplied output processor replaces the default logits / loss path."""
+    captured_kwargs = {}
+    sentinel = torch.randn(2, 4, 8)
+
+    def output_processor(**kwargs):
+        captured_kwargs.update(kwargs)
+        return sentinel
+
+    model = _make_postprocess_stub(
+        SimpleNamespace(
+            mtp_num_layers=None, inference_cuda_graph_scope=InferenceCudaGraphScope.none
+        ),
+        training=True,
+    )
+    hidden_states = torch.randn(4, 2, 8)
+    labels = torch.zeros(2, 4, dtype=torch.long)
+    context = object()
+
+    output = HybridModel._postprocess(
+        model,
+        hidden_states=hidden_states,
+        input_ids=torch.zeros(2, 4, dtype=torch.long),
+        position_ids=torch.zeros(2, 4, dtype=torch.long),
+        labels=labels,
+        rotary_pos_emb=None,
+        mtp_in_postprocess=False,
+        runtime_gather_output=False,
+        inference_context=None,
+        output_processor=output_processor,
+        output_processor_context=context,
+    )
+
+    assert output is sentinel
+    assert captured_kwargs["hidden_states"] is hidden_states
+    assert captured_kwargs["labels"] is labels
+    assert captured_kwargs["context"] is context
+    assert captured_kwargs["output_layer"] is model.output_layer
+    assert captured_kwargs["compute_language_model_loss"] is model.compute_language_model_loss
 
 
 def test_hybrid_logging_process_groups_are_paired():
@@ -139,6 +318,137 @@ def test_hybrid_model_with_custom_process_groups(tmp_path, tp_size, cp_size, pp_
         assert logits.shape[2] == divide(model.vocab_size, tp_size)
     finally:
         Utils.destroy_model_parallel()
+
+
+# Checkpoint keys that the pinned Megatron-LM (12c20d8f0) gives the flat-pattern models of
+# ``TestHybridModel.test_flat_pattern_checkpoint_keys_match_the_pin``.
+PIN_FLAT_PATTERN_CHECKPOINT_KEYS = {
+    "M*-": frozenset(
+        [
+            "decoder.final_norm._extra_state",
+            "decoder.final_norm.bias",
+            "decoder.final_norm.weight",
+            "decoder.layers.0.mixer.A_log",
+            "decoder.layers.0.mixer.D",
+            "decoder.layers.0.mixer.conv1d.bias",
+            "decoder.layers.0.mixer.conv1d.weight",
+            "decoder.layers.0.mixer.dt_bias",
+            "decoder.layers.0.mixer.in_proj._extra_state",
+            "decoder.layers.0.mixer.in_proj.layer_norm_bias",
+            "decoder.layers.0.mixer.in_proj.layer_norm_weight",
+            "decoder.layers.0.mixer.in_proj.weight",
+            "decoder.layers.0.mixer.norm.weight",
+            "decoder.layers.0.mixer.out_proj._extra_state",
+            "decoder.layers.0.mixer.out_proj.weight",
+            "decoder.layers.1.self_attention.linear_proj._extra_state",
+            "decoder.layers.1.self_attention.linear_proj.bias",
+            "decoder.layers.1.self_attention.linear_proj.weight",
+            "decoder.layers.1.self_attention.linear_qkv._extra_state",
+            "decoder.layers.1.self_attention.linear_qkv.bias",
+            "decoder.layers.1.self_attention.linear_qkv.layer_norm_bias",
+            "decoder.layers.1.self_attention.linear_qkv.layer_norm_weight",
+            "decoder.layers.1.self_attention.linear_qkv.weight",
+            "decoder.layers.2.mlp.linear_fc1._extra_state",
+            "decoder.layers.2.mlp.linear_fc1.bias",
+            "decoder.layers.2.mlp.linear_fc1.layer_norm_bias",
+            "decoder.layers.2.mlp.linear_fc1.layer_norm_weight",
+            "decoder.layers.2.mlp.linear_fc1.weight",
+            "decoder.layers.2.mlp.linear_fc2._extra_state",
+            "decoder.layers.2.mlp.linear_fc2.bias",
+            "decoder.layers.2.mlp.linear_fc2.weight",
+            "embedding.word_embeddings.weight",
+            "output_layer._extra_state",
+            "output_layer.weight",
+        ]
+    ),
+    "MEM*EME": frozenset(
+        [
+            "decoder.final_norm._extra_state",
+            "decoder.final_norm.bias",
+            "decoder.final_norm.weight",
+            "decoder.layers.0.mixer.A_log",
+            "decoder.layers.0.mixer.D",
+            "decoder.layers.0.mixer.conv1d.bias",
+            "decoder.layers.0.mixer.conv1d.weight",
+            "decoder.layers.0.mixer.dt_bias",
+            "decoder.layers.0.mixer.in_proj._extra_state",
+            "decoder.layers.0.mixer.in_proj.layer_norm_bias",
+            "decoder.layers.0.mixer.in_proj.layer_norm_weight",
+            "decoder.layers.0.mixer.in_proj.weight",
+            "decoder.layers.0.mixer.norm.weight",
+            "decoder.layers.0.mixer.out_proj._extra_state",
+            "decoder.layers.0.mixer.out_proj.weight",
+            "decoder.layers.1.mlp.experts.experts.linear_fc1._extra_state",
+            "decoder.layers.1.mlp.experts.experts.linear_fc1.bias",
+            "decoder.layers.1.mlp.experts.experts.linear_fc1.weight",
+            "decoder.layers.1.mlp.experts.experts.linear_fc2._extra_state",
+            "decoder.layers.1.mlp.experts.experts.linear_fc2.bias",
+            "decoder.layers.1.mlp.experts.experts.linear_fc2.weight",
+            "decoder.layers.1.mlp.router.bias",
+            "decoder.layers.1.mlp.router.weight",
+            "decoder.layers.1.pre_mlp_layernorm._extra_state",
+            "decoder.layers.1.pre_mlp_layernorm.bias",
+            "decoder.layers.1.pre_mlp_layernorm.weight",
+            "decoder.layers.2.mixer.A_log",
+            "decoder.layers.2.mixer.D",
+            "decoder.layers.2.mixer.conv1d.bias",
+            "decoder.layers.2.mixer.conv1d.weight",
+            "decoder.layers.2.mixer.dt_bias",
+            "decoder.layers.2.mixer.in_proj._extra_state",
+            "decoder.layers.2.mixer.in_proj.layer_norm_bias",
+            "decoder.layers.2.mixer.in_proj.layer_norm_weight",
+            "decoder.layers.2.mixer.in_proj.weight",
+            "decoder.layers.2.mixer.norm.weight",
+            "decoder.layers.2.mixer.out_proj._extra_state",
+            "decoder.layers.2.mixer.out_proj.weight",
+            "decoder.layers.3.self_attention.linear_proj._extra_state",
+            "decoder.layers.3.self_attention.linear_proj.bias",
+            "decoder.layers.3.self_attention.linear_proj.weight",
+            "decoder.layers.3.self_attention.linear_qkv._extra_state",
+            "decoder.layers.3.self_attention.linear_qkv.bias",
+            "decoder.layers.3.self_attention.linear_qkv.layer_norm_bias",
+            "decoder.layers.3.self_attention.linear_qkv.layer_norm_weight",
+            "decoder.layers.3.self_attention.linear_qkv.weight",
+            "decoder.layers.4.mlp.experts.experts.linear_fc1._extra_state",
+            "decoder.layers.4.mlp.experts.experts.linear_fc1.bias",
+            "decoder.layers.4.mlp.experts.experts.linear_fc1.weight",
+            "decoder.layers.4.mlp.experts.experts.linear_fc2._extra_state",
+            "decoder.layers.4.mlp.experts.experts.linear_fc2.bias",
+            "decoder.layers.4.mlp.experts.experts.linear_fc2.weight",
+            "decoder.layers.4.mlp.router.bias",
+            "decoder.layers.4.mlp.router.weight",
+            "decoder.layers.4.pre_mlp_layernorm._extra_state",
+            "decoder.layers.4.pre_mlp_layernorm.bias",
+            "decoder.layers.4.pre_mlp_layernorm.weight",
+            "decoder.layers.5.mixer.A_log",
+            "decoder.layers.5.mixer.D",
+            "decoder.layers.5.mixer.conv1d.bias",
+            "decoder.layers.5.mixer.conv1d.weight",
+            "decoder.layers.5.mixer.dt_bias",
+            "decoder.layers.5.mixer.in_proj._extra_state",
+            "decoder.layers.5.mixer.in_proj.layer_norm_bias",
+            "decoder.layers.5.mixer.in_proj.layer_norm_weight",
+            "decoder.layers.5.mixer.in_proj.weight",
+            "decoder.layers.5.mixer.norm.weight",
+            "decoder.layers.5.mixer.out_proj._extra_state",
+            "decoder.layers.5.mixer.out_proj.weight",
+            "decoder.layers.6.mlp.experts.experts.linear_fc1._extra_state",
+            "decoder.layers.6.mlp.experts.experts.linear_fc1.bias",
+            "decoder.layers.6.mlp.experts.experts.linear_fc1.weight",
+            "decoder.layers.6.mlp.experts.experts.linear_fc2._extra_state",
+            "decoder.layers.6.mlp.experts.experts.linear_fc2.bias",
+            "decoder.layers.6.mlp.experts.experts.linear_fc2.weight",
+            "decoder.layers.6.mlp.router.bias",
+            "decoder.layers.6.mlp.router.weight",
+            "decoder.layers.6.pre_mlp_layernorm._extra_state",
+            "decoder.layers.6.pre_mlp_layernorm.bias",
+            "decoder.layers.6.pre_mlp_layernorm.weight",
+            "embedding.word_embeddings.weight",
+            "output_layer._extra_state",
+            "output_layer.weight",
+        ]
+    ),
+}
 
 
 class TestHybridModel:
@@ -316,6 +626,133 @@ class TestHybridModel:
         torch.save(self.model.state_dict(), path)
 
         self.model.load_state_dict(torch.load(path))
+
+    def test_grouped_sharded_state_dict_uses_transformer_checkpoint_keys(self):
+        """Grouped HybridModel checkpoints should be load-compatible with GPTModel keys."""
+        model_config = TransformerConfig(
+            num_layers=2, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
+        )
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="[*-]",
+        )
+
+        sharded_state_dict = model.sharded_state_dict()
+        sharded_keys = {value.key for value in sharded_state_dict.values() if hasattr(value, "key")}
+
+        assert "decoder.layers.0.self_attention.linear_qkv.weight" in sharded_keys
+        assert "decoder.layers.0.mlp.linear_fc1.weight" in sharded_keys
+        assert "decoder.layers.1.mlp.linear_fc1.weight" not in sharded_keys
+        assert "decoder.final_layernorm.weight" in sharded_keys
+        assert "decoder.final_norm.weight" not in sharded_keys
+        assert "output_layer._extra_state" not in sharded_state_dict
+
+    def test_ungrouped_sharded_state_dict_keeps_hybrid_final_norm_key(self):
+        """Non-grouped patterns keep ``final_norm`` so older hybrid checkpoints load."""
+        model_config = TransformerConfig(
+            num_layers=2, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
+        )
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="*-",
+        )
+
+        sharded_state_dict = model.sharded_state_dict()
+        sharded_keys = {value.key for value in sharded_state_dict.values() if hasattr(value, "key")}
+
+        assert "decoder.final_norm.weight" in sharded_keys
+        assert "decoder.final_layernorm.weight" not in sharded_keys
+
+    @pytest.mark.parametrize(
+        "pattern,config_kwargs",
+        [
+            ("M*-", dict(num_layers=3)),
+            ("MEM*EME", dict(num_layers=7, num_moe_experts=4, moe_grouped_gemm=True)),
+        ],
+        ids=["mamba-attention-mlp", "nano-shaped-moe"],
+    )
+    def test_flat_pattern_checkpoint_keys_match_the_pin(self, pattern, config_kwargs):
+        """[Geodesic adaptation] A flat pattern keeps exactly the checkpoint keys of the pinned
+        Megatron-LM, the output layer's extra state included, so its checkpoints load in trees
+        with and without the hybrid EP-overlap port."""
+        model_config = TransformerConfig(
+            hidden_size=256, num_attention_heads=4, use_cpu_initialization=True, **config_kwargs
+        )
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern=pattern,
+        )
+
+        sharded_state_dict = model.sharded_state_dict()
+        sharded_keys = {value.key for value in sharded_state_dict.values() if hasattr(value, "key")}
+
+        assert sharded_keys == PIN_FLAT_PATTERN_CHECKPOINT_KEYS[pattern]
+
+    def test_mtp_moe_routers_keep_the_pinned_behaviour(self):
+        """[Geodesic adaptation] MoE routers inside an MTP HybridStack are built with
+        ``is_mtp_layer=False``, as at the pin, which decides their aux-loss scaling and logging
+        slot; the overlap is off here, so this is the configuration production trains."""
+        model_config = TransformerConfig(
+            num_layers=3,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            num_moe_experts=4,
+            moe_grouped_gemm=True,
+            mtp_num_layers=1,
+        )
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="M*E/*E",
+        )
+
+        mtp_routers = [m for m in model.mtp.modules() if isinstance(m, TopKRouter)]
+        assert len(mtp_routers) == 1
+        assert mtp_routers[0].is_mtp_layer is False
+
+    def test_preprocess_takes_decoder_input_without_input_ids(self):
+        """[Geodesic adaptation] Static-batching inference with flash-decode may pass only
+        ``decoder_input``. ``_preprocess`` leaves ``sequence_len_offset`` to HybridStack, as the
+        pinned forward did, instead of reading the batch size from ``input_ids``."""
+        model_config = TransformerConfig(
+            num_layers=3,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            flash_decode=True,
+        )
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="M*-",
+        )
+        decoder_input = torch.randn(4, 2, 256)
+        inference_context = StaticInferenceContext(max_batch_size=2, max_sequence_length=4)
+
+        with InferenceMode.active():
+            decoder_input_out, _, _, _, sequence_len_offset, _ = model._preprocess(
+                input_ids=None,
+                position_ids=None,
+                decoder_input=decoder_input,
+                inference_context=inference_context,
+            )
+
+        assert sequence_len_offset is None
+        assert decoder_input_out.unwrap() is decoder_input
 
     def test_layer_numbers(self):
         """

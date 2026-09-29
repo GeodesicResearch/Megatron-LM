@@ -166,6 +166,16 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self._annotate_tensor_parallelism(module)
 
         if config.overlap_moe_expert_parallel_comm:
+            # [Geodesic adaptation] The hybrid EP-overlap schedule units (flat-pattern layer runs
+            # and bracketed HybridStack groups) are not reached by Megatron-FSDP's unit discovery
+            # and reshard hooks, so hybrid models refuse the combination.
+            from megatron.core.models.hybrid.hybrid_block import HybridStack
+
+            if any(isinstance(submodule, HybridStack) for submodule in module.modules()):
+                raise NotImplementedError(
+                    "Megatron-FSDP does not support overlap_moe_expert_parallel_comm for hybrid "
+                    "(HybridStack) models."
+                )
             assert not ddp_config.fsdp_double_buffer, (
                 "1F1B overlap with FSDP does not support double buffer. "
                 "Please set fsdp_double_buffer=False in the ddp config."
