@@ -246,9 +246,24 @@ class ModelParallelConfig:
        Defaults to False.
     """
 
-    cross_entropy_fusion_impl: Literal['native', 'te'] = 'native'
+    cross_entropy_fusion_impl: Literal['native', 'te', 'linear'] = 'native'
     """If 'native', MCore based CE loss fusion is used, if 'te', Parallel CE loss
-       from Transformer Engine library is used. Defaults to 'native'.
+       from Transformer Engine library is used. If 'linear', the output layer and the loss are
+       fused over vocabulary chunks (fusions/fused_chunked_linear_cross_entropy.py), without the
+       fp32 copies of the logits; HybridModel only, tensor-parallel size 1. Defaults to 'native'.
+    """
+
+    cross_entropy_fusion_vocab_chunk_size: int = 16384
+    """Vocabulary columns per chunk of the 'linear' cross-entropy fusion. Only read when
+       cross_entropy_fusion_impl is 'linear'.
+    """
+
+    cross_entropy_fusion_saved_logit_chunks: int = 0
+    """How many chunks of the 'linear' cross-entropy fusion keep their logits (tokens x chunk, in
+       the output-layer dtype) from the forward to the backward; the others are recomputed there,
+       one extra GEMM each. 0 keeps none (least memory); any value at least the number of chunks
+       keeps all of them (no recompute). Results are identical either way. Only read when
+       cross_entropy_fusion_impl is 'linear'.
     """
 
     tp_comm_overlap_disable_qkv: bool = False

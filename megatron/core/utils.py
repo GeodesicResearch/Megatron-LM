@@ -1165,9 +1165,8 @@ def drain_embedding_wgrad_compute(
         grad_output_buffer
     ), "Length of activation and gradient buffers need to be equal!"
 
-    import fused_weight_gradient_mlp_cuda
-
     from megatron.core.parallel_state import get_global_memory_buffer
+    from megatron.core.tensor_parallel.layers import accumulate_wgrad_into_main_grad
 
     input = embedding_activation_buffer.pop(0)
     world_size = tp_group.size()
@@ -1195,16 +1194,7 @@ def drain_embedding_wgrad_compute(
             weight.main_grad = weight.get_main_grad()
 
         if config.gradient_accumulation_fusion:
-            if weight.main_grad.dtype == torch.float32:
-                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
-                    all_gathered_input, grad_output, weight.main_grad
-                )
-            elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
-                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
-                    all_gathered_input, grad_output, weight.main_grad
-                )
-            else:
-                raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
+            accumulate_wgrad_into_main_grad(all_gathered_input, grad_output, weight.main_grad)
 
     # We have all_gathered_input list acting as a double buffer here,
     # since we are pipelining the AllGather and GEMM,one buffer all gathers

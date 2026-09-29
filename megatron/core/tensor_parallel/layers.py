@@ -461,6 +461,63 @@ def linear_with_frozen_weight(
     return LinearWithFrozenWeight.apply(*args)
 
 
+def accumulate_wgrad_into_main_grad(
+    total_input: torch.Tensor, grad_output: torch.Tensor, main_grad: torch.Tensor
+) -> None:
+    """``main_grad += grad_output^T @ total_input`` with APEX's fused weight-gradient GEMM.
+
+    Both operands are 2D ``[tokens, features]``. The GEMM accumulates in fp32 and rounds once
+    into ``main_grad``, which may be fp32 or (with low-precision gradient accumulation) fp16/bf16.
+    """
+    if main_grad.dtype == torch.float32:
+        fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(total_input, grad_output, main_grad)
+    elif main_grad.dtype in (torch.float16, torch.bfloat16):
+        fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(total_input, grad_output, main_grad)
+    else:
+        raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
+
+
+def wgrad_after_main_grad_accumulation(
+    weight: torch.Tensor, dtype: torch.dtype
+) -> Optional[torch.Tensor]:
+    """The grad_weight a backward returns once it has accumulated into ``weight.main_grad``.
+
+    Weights managed by Megatron DDP carry ``grad_added_to_main_grad``: they get a dummy tensor
+    (zero-filled when ``weight.zero_out_wgrad`` is set) and the flag is raised so the gradient
+    hook does not add it again. Other weights get ``None``.
+    """
+    if not hasattr(weight, "grad_added_to_main_grad"):
+        return None
+    # When overlap_grad_reduce is True, need to ensure that backward hooks
+    # are all run on the main backprop thread to prevent deadlocks. Setup
+    # dummy grad_weight tensor to prevent backward hooks from being run
+    # in a background thread.
+    if getattr(weight, "zero_out_wgrad", False):
+        if HAVE_TE:
+            # get_dummy_wgrad function in TE enables reuse of single dummy wgrad buffer
+            # across different layers/microbatches. The function accepts shape as list.
+            grad_weight = get_dummy_wgrad(list(weight.main_grad.shape), dtype, zero=True)
+        else:
+            grad_weight = torch.zeros(
+                weight.main_grad.shape,
+                dtype=dtype,
+                device=torch.cuda.current_device(),
+                requires_grad=False,
+            )
+    else:
+        if HAVE_TE:
+            grad_weight = get_dummy_wgrad(list(weight.main_grad.shape), dtype)
+        else:
+            grad_weight = torch.empty(
+                weight.main_grad.shape,
+                dtype=dtype,
+                device=torch.cuda.current_device(),
+                requires_grad=False,
+            )
+    weight.grad_added_to_main_grad = True
+    return grad_weight
+
+
 class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     """See linear_with_grad_accumulation_and_async_allreduce"""
 
@@ -602,51 +659,9 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                     else:
                         torch.matmul(grad_output.t(), total_input, out=weight.main_grad)
                 else:
-                    if weight.main_grad.dtype == torch.float32:
-                        fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
-                            total_input, grad_output, weight.main_grad
-                        )
-                    elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
-                        fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
-                            total_input, grad_output, weight.main_grad
-                        )
-                    else:
-                        raise RuntimeError(
-                            "Unsupported gradient type for gradient accumulation fusion"
-                        )
+                    accumulate_wgrad_into_main_grad(total_input, grad_output, weight.main_grad)
 
-            if hasattr(weight, "grad_added_to_main_grad"):
-                # When overlap_grad_reduce is True, need to ensure that backward hooks
-                # are all run on the main backprop thread to prevent deadlocks. Setup
-                # dummy grad_weight tensor to prevent backward hooks from being run
-                # in a background thread.
-                if getattr(weight, "zero_out_wgrad", False):
-                    if HAVE_TE:
-                        # get_dummy_wgrad function in TE enables reuse of single dummy wgrad buffer
-                        # across different layers/microbatches. The function accepts shape as list.
-                        grad_weight = get_dummy_wgrad(
-                            list(weight.main_grad.shape), input.dtype, zero=True
-                        )
-                    else:
-                        grad_weight = torch.zeros(
-                            weight.main_grad.shape,
-                            dtype=input.dtype,
-                            device=torch.cuda.current_device(),
-                            requires_grad=False,
-                        )
-                else:
-                    if HAVE_TE:
-                        grad_weight = get_dummy_wgrad(list(weight.main_grad.shape), input.dtype)
-                    else:
-                        grad_weight = torch.empty(
-                            weight.main_grad.shape,
-                            dtype=input.dtype,
-                            device=torch.cuda.current_device(),
-                            requires_grad=False,
-                        )
-                weight.grad_added_to_main_grad = True
-            else:
-                grad_weight = None
+            grad_weight = wgrad_after_main_grad_accumulation(weight, input.dtype)
         else:
             grad_weight = grad_output.t().matmul(total_input)
         grad_bias = grad_output.sum(dim=0) if use_bias else None
@@ -991,6 +1006,24 @@ class ColumnParallelLinear(torch.nn.Module):
         else:
             return linear_with_grad_accumulation_and_async_allreduce(input, weight, *args, **kwargs)
 
+    def _resolve_weight(self, weight: Optional[torch.Tensor]) -> torch.Tensor:
+        """The weight a forward uses: the supplied one (shape-checked) or this layer's own."""
+        if weight is None:
+            if self.weight is None:
+                raise RuntimeError(
+                    "weight was not supplied to ColumnParallelLinear forward pass "
+                    "and skip_weight_param_allocation is True."
+                )
+            return self.weight
+        # Check the weight passed in is the correct shape
+        expected_shape = (self.output_size_per_partition, self.input_size)
+        if weight.shape != expected_shape:
+            raise RuntimeError(
+                f"supplied weight's shape is {tuple(weight.shape)}, "
+                f"not {expected_shape} as expected"
+            )
+        return weight
+
     def forward(
         self,
         input_: torch.Tensor,
@@ -1012,21 +1045,7 @@ class ColumnParallelLinear(torch.nn.Module):
             - bias
 
         """
-        if weight is None:
-            if self.weight is None:
-                raise RuntimeError(
-                    "weight was not supplied to ColumnParallelLinear forward pass "
-                    "and skip_weight_param_allocation is True."
-                )
-            weight = self.weight
-        else:
-            # Check the weight passed in is the correct shape
-            expected_shape = (self.output_size_per_partition, self.input_size)
-            if weight.shape != expected_shape:
-                raise RuntimeError(
-                    f"supplied weight's shape is {tuple(weight.shape)}, "
-                    f"not {expected_shape} as expected"
-                )
+        weight = self._resolve_weight(weight)
 
         bias = self.bias if not self.skip_bias_add else None
 

@@ -238,6 +238,21 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
         )
 
+        # With the linear cross-entropy fusion the output layer computes the loss itself, without
+        # logits (LinearCrossEntropyModule). Multi-token prediction and MuP need the logits.
+        self.fuse_linear_cross_entropy = (
+            config.cross_entropy_loss_fusion and config.cross_entropy_fusion_impl == 'linear'
+        )
+        if self.fuse_linear_cross_entropy:
+            if self.mtp_pattern is not None and self.mtp_num_depths > 0:
+                raise ValueError(
+                    "cross_entropy_fusion_impl='linear' does not support multi-token prediction."
+                )
+            if config.use_mup:
+                raise ValueError(
+                    "cross_entropy_fusion_impl='linear' does not apply the MuP logit scaling."
+                )
+
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
         self.model_type = ModelType.encoder_or_decoder
@@ -320,7 +335,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         # Output
         if post_process or self.mtp_process:
-            self.output_layer = tensor_parallel.ColumnParallelLinear(
+            if self.fuse_linear_cross_entropy:
+                from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
+
+                output_layer_class = LinearCrossEntropyModule
+            else:
+                output_layer_class = tensor_parallel.ColumnParallelLinear
+            self.output_layer = output_layer_class(
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
@@ -589,6 +610,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 scale_logits=self._scale_logits,
                 config=self.config,
             )
+
+        if labels is not None and not in_inference_mode and self.fuse_linear_cross_entropy:
+            return self.output_layer(hidden_states, weight=output_weight, labels=labels)
 
         if (
             in_inference_mode
