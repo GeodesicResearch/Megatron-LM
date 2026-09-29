@@ -350,6 +350,35 @@ def reset_hybrid_ep_buffer():
     _hybrid_ep_buffer = None
 
 
+# Position of the dispatched-token count in a HybridEP dispatch handle, the same in DeepEP's fused
+# and unfused layouts: (sparse_to_dense_map, rdma_to_attn_map, attn_to_rdma_map,
+# num_dispatched_tokens_tensor, ...).
+_HANDLE_DISPATCHED_TOKENS = 3
+
+
+def _with_device_dispatched_tokens(handle: tuple, device: torch.device) -> tuple:
+    '''
+    Return the HybridEP dispatch handle with its dispatched-token count in device memory.
+
+    Without num_permuted_tokens, HybridEP keeps the count in pinned host memory, and its permute
+    and unpermute kernels read it from device code when they start. PyTorch's caching host
+    allocator is not told about those reads: once the handle is freed it can hand the block out
+    again while a combine or backward that reads it is still queued, and that kernel then runs
+    on a foreign count, over rows past the received tokens. A non-blocking copy on the current
+    stream gives every later reader device memory whose reuse follows the stream, and the host
+    allocator holds the pinned source until the copy, and so the dispatch kernels queued before
+    it, have run.
+    '''
+    count = handle[_HANDLE_DISPATCHED_TOKENS]
+    if count.is_cuda:
+        return handle
+    return (
+        handle[:_HANDLE_DISPATCHED_TOKENS]
+        + (count.to(device, non_blocking=True),)
+        + handle[_HANDLE_DISPATCHED_TOKENS + 1 :]
+    )
+
+
 class HybridEPDispatch(torch.autograd.Function):
     '''
     Fused dispatch operation for permute + dispatch a2a + permute using the HybridEP backend
@@ -428,6 +457,7 @@ class HybridEPDispatch(torch.autograd.Function):
             non_blocking=non_blocking,
             **({"fuse_permute_dispatch": fused} if fused else {}),
         )
+        handle = _with_device_dispatched_tokens(handle, x.device)
 
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
