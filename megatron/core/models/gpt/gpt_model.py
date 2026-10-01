@@ -338,18 +338,14 @@ class GPTModel(LanguageModule):
                 decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(
                     decoder_input, group=self.pg_collection.tp
                 )
-            if padding_mask is not None and self.config.sequence_parallel:
-                padding_mask = (
-                    tensor_parallel.scatter_to_sequence_parallel_region(
-                        padding_mask.transpose(0, 1).contiguous()
-                    )
-                    .transpose(0, 1)
-                    .contiguous()
-                )
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor
             decoder_input = None
+
+        # [Geodesic adaptation.] Every pipeline stage, not only the first, gives its layers their sequence-parallel
+        # share of the padding mask.
+        padding_mask = self._padding_mask_for_layers(padding_mask)
 
         # Rotary positional embeddings (embedding is None for PP intermediate devices)
         rotary_pos_emb = None

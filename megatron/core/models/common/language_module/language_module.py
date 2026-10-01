@@ -104,6 +104,24 @@ class LanguageModule(MegatronModule):
                 return True
         return False
 
+    def _padding_mask_for_layers(self, padding_mask: Optional[Tensor]) -> Optional[Tensor]:
+        """The ``[batch, sequence]`` padding mask laid out like this rank's hidden states.
+
+        [Geodesic adaptation.] The MoE router reads the mask position for position against its hidden states, which
+        under sequence parallelism hold this tensor-parallel rank's share of the sequence on every pipeline stage,
+        while every stage receives the whole mask. So under sequence parallelism this returns the rank's share, over
+        the tensor-parallel group the hidden states are scattered over; otherwise the mask unchanged (or None).
+        """
+        if padding_mask is None or not self.config.sequence_parallel:
+            return padding_mask
+        return (
+            tensor_parallel.scatter_to_sequence_parallel_region(
+                padding_mask.transpose(0, 1).contiguous(), group=self.pg_collection.tp
+            )
+            .transpose(0, 1)
+            .contiguous()
+        )
+
     # pylint: disable=line-too-long
     def _set_attention_backend(self):
         """Set attention backend
