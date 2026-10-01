@@ -436,6 +436,19 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             # hidden_states from encoder.input_tensor.
             decoder_input = None
 
+        # [Geodesic adaptation.] The MoE router reads the padding mask position for position against its hidden
+        # states, which under sequence parallelism hold this tensor-parallel rank's share of the sequence on every
+        # pipeline stage, while every stage receives the whole [batch, sequence] mask. So every stage, not only the
+        # first as in GPTModel, gives its layers the same share of the mask.
+        if padding_mask is not None and self.config.sequence_parallel:
+            padding_mask = (
+                tensor_parallel.scatter_to_sequence_parallel_region(
+                    padding_mask.transpose(0, 1).contiguous(), group=self.pg_collection.tp
+                )
+                .transpose(0, 1)
+                .contiguous()
+            )
+
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
