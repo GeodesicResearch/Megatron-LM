@@ -86,6 +86,24 @@ def _get_hash_moe_layer_threshold(
     return moe_layer_numbers[n_hash_layers - 1]
 
 
+def _local_hash_moe_layer_numbers(
+    layer_type_list: Sequence[str | TransformerConfig], layer_offset: int, hash_moe_layer_threshold: int
+) -> list[int]:
+    """Return the global numbers of the hash-routed MoE layers that this stage holds."""
+    if hash_moe_layer_threshold <= 0:
+        return []
+
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+    from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
+
+    return [
+        layer_offset + local_layer_number
+        for local_layer_number, layer_type in enumerate(layer_type_list, start=1)
+        if (layer_type == Symbols.MOE or type(layer_type) is MoELayerConfig)
+        and layer_offset + local_layer_number <= hash_moe_layer_threshold
+    ]
+
+
 class HybridModel(LanguageModule, GraphableMegatronModule):
     """Hybrid language model.
 
@@ -455,6 +473,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # before constructing the decoder or MTP modules.
         layer_utils.validate_tp_comm_overlap(self.config, '', has_mtp=self.mtp_process)
 
+        self.local_hash_moe_layer_numbers = _local_hash_moe_layer_numbers(
+            layer_config_list, layer_offset, hash_moe_layer_threshold
+        )
+
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
         self.model_type = ModelType.encoder_or_decoder
@@ -757,11 +779,19 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         hash_input_ids = None
         if self.config.moe_num_hash_layers > 0 or self._has_custom_layers:
             hash_input_ids = input_ids
+        if self.local_hash_moe_layer_numbers and input_ids is None:
+            raise ValueError(
+                f"This pipeline stage holds hash MoE layer(s) {self.local_hash_moe_layer_numbers}, which route by "
+                "token id, but no input_ids reached it. The training step must load the tokens on every stage "
+                "that holds a hash layer."
+            )
+        # Stages after the first hold their activations in decoder.input_tensor, not decoder_input.
+        ids_reference = decoder_input if decoder_input is not None else self.decoder.input_tensor
         if (
             self.config.sequence_parallel
-            and decoder_input is not None
+            and ids_reference is not None
             and hash_input_ids is not None
-            and hash_input_ids.shape[1] != decoder_input.shape[0]
+            and hash_input_ids.shape[1] != ids_reference.shape[0]
         ):
             hash_input_ids = (
                 tensor_parallel.scatter_to_sequence_parallel_region(

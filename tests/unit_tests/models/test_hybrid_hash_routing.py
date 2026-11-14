@@ -15,6 +15,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment
 from megatron.core.models.hybrid.hybrid_model import (
     HybridModel,
     _get_hash_moe_layer_threshold,
+    _local_hash_moe_layer_numbers,
 )
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
@@ -123,6 +124,7 @@ class RecordingNonTransformerLayer(torch.nn.Module):
 class RecordingDecoder:
     def __init__(self):
         self.kwargs = None
+        self.input_tensor = None
 
     def __call__(self, **kwargs):
         self.kwargs = kwargs
@@ -314,6 +316,7 @@ def test_hybrid_model_passes_ids_to_decoder_only_for_hash_routing(
         config=config,
         hybrid_layer_config_list=None,
         _has_custom_layers=False,
+        local_hash_moe_layer_numbers=[],
         decoder=decoder,
         position_embedding_type='none',
         pre_process=True,
@@ -355,6 +358,7 @@ def test_hybrid_model_non_embedding_stage_passes_received_ids_to_hash_decoder():
         ),
         hybrid_layer_config_list=None,
         _has_custom_layers=False,
+        local_hash_moe_layer_numbers=[],
         decoder=decoder,
         position_embedding_type='none',
         pre_process=False,
@@ -395,6 +399,7 @@ def test_hybrid_model_sequence_shards_hash_ids_with_decoder_input(monkeypatch, p
     model = SimpleNamespace(
         hybrid_layer_config_list=None,
         _has_custom_layers=False,
+        local_hash_moe_layer_numbers=[],
         config=SimpleNamespace(
             fine_grained_activation_offloading=False,
             moe_paged_stash=False,
@@ -480,6 +485,7 @@ def test_hybrid_model_scatters_embedding_for_sequence_parallel(monkeypatch):
         embedding=embedding,
         hybrid_layer_config_list=None,
         _has_custom_layers=False,
+        local_hash_moe_layer_numbers=[],
         position_embedding_type="none",
         pre_process=True,
         post_process=False,
@@ -549,6 +555,7 @@ def test_hybrid_model_shards_each_layout_padding_mask(
         decoder=decoder,
         hybrid_layer_config_list=None,
         _has_custom_layers=False,
+        local_hash_moe_layer_numbers=[],
         position_embedding_type="none",
         pre_process=pre_process,
         post_process=False,
@@ -889,3 +896,72 @@ def test_hash_routing_selects_the_experts_of_the_token_id_table():
             row = sequence_index * batch + batch_index
             expected = set(table[input_ids[batch_index, sequence_index]].tolist())
             assert set(routing_probs[row].nonzero().flatten().tolist()) == expected
+
+
+def _non_embedding_stage_model(decoder, *, sequence_parallel, hash_layers, tp_group=None):
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            fine_grained_activation_offloading=False,
+            moe_paged_stash=False,
+            moe_num_hash_layers=3,
+            hash_moe_vocab_size=128,
+            sequence_parallel=sequence_parallel,
+            freeze_base_model_for_mtp=False,
+        ),
+        hybrid_layer_config_list=None,
+        _has_custom_layers=False,
+        local_hash_moe_layer_numbers=hash_layers,
+        decoder=decoder,
+        position_embedding_type='none',
+        pre_process=False,
+        post_process=False,
+        share_embeddings_and_output_weights=False,
+        mtp_process=False,
+        vocab_size=128,
+        pg_collection=SimpleNamespace(tp=tp_group),
+    )
+
+
+def test_hybrid_model_non_embedding_stage_scatters_ids_under_sequence_parallelism(monkeypatch):
+    """A stage after the first has no decoder_input, so its ids are matched to decoder.input_tensor."""
+    decoder = RecordingDecoder()
+    decoder.input_tensor = torch.randn(2, 2, 8)  # this rank's half of 4 tokens
+    tp_group = object()
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_model.tensor_parallel.scatter_to_sequence_parallel_region",
+        lambda tensor, group: tensor[: tensor.shape[0] // 2].contiguous(),
+    )
+    model = _non_embedding_stage_model(decoder, sequence_parallel=True, hash_layers=[2], tp_group=tp_group)
+    input_ids = torch.arange(8).reshape(2, 4)
+
+    HybridModel.forward(
+        model,
+        input_ids=input_ids,
+        position_ids=torch.arange(4).repeat(2, 1),
+        attention_mask=None,
+        decoder_input=None,
+    )
+
+    assert torch.equal(decoder.kwargs['input_ids'], input_ids[:, :2])
+
+
+def test_hybrid_model_stage_with_hash_layers_refuses_missing_ids():
+    decoder = RecordingDecoder()
+    decoder.input_tensor = torch.randn(4, 2, 8)
+    model = _non_embedding_stage_model(decoder, sequence_parallel=False, hash_layers=[2, 3])
+
+    with pytest.raises(ValueError, match=r"holds hash MoE layer\(s\) \[2, 3\]"):
+        HybridModel.forward(
+            model,
+            input_ids=None,
+            position_ids=torch.arange(4).repeat(2, 1),
+            attention_mask=None,
+            decoder_input=None,
+        )
+
+
+def test_local_hash_moe_layer_numbers_use_global_layer_numbers():
+    moe, other = LayerSymbols.MOE, LayerSymbols.MLP if hasattr(LayerSymbols, "MLP") else "-"
+    assert _local_hash_moe_layer_numbers([other, moe, other, moe], layer_offset=0, hash_moe_layer_threshold=4) == [2, 4]
+    assert _local_hash_moe_layer_numbers([moe, other], layer_offset=6, hash_moe_layer_threshold=4) == []
+    assert _local_hash_moe_layer_numbers([moe], layer_offset=2, hash_moe_layer_threshold=0) == []
