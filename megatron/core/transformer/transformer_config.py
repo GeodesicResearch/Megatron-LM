@@ -29,7 +29,6 @@ from megatron.core.transformer.enums import (
     CudaGraphModule,
     CudaGraphScope,
     InferenceCudaGraphScope,
-    LayerType,
 )
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
@@ -4033,14 +4032,6 @@ class TransformerConfig(ModelParallelConfig):
                 assert self.pipeline_model_parallel_layout is not None, (
                     "pipeline_model_parallel_layout must be set when using hash MoE "
                     "layers with pipeline parallelism (PP > 1)."
-                )
-                embedding_stage = self.pipeline_model_parallel_layout.layout[0][0]
-                n_decoders_with_embedding = embedding_stage.count(LayerType.decoder)
-                assert self.moe_num_hash_layers <= n_decoders_with_embedding, (
-                    "All hash MoE layers must currently share the virtual pipeline stage "
-                    "that owns the embedding. The embedding stage has "
-                    f"{n_decoders_with_embedding} decoder layers, but "
-                    f"moe_num_hash_layers={self.moe_num_hash_layers}."
                 )
             assert (
                 not self.overlap_moe_expert_parallel_comm
