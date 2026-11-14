@@ -857,3 +857,35 @@ def test_hash_top1_preserves_gate_weight_and_gradient(score_function):
     routing_probs.sum().backward()
     assert logits.grad is not None
     assert torch.count_nonzero(logits.grad) == 2
+
+
+def test_hash_routing_selects_the_experts_of_the_token_id_table():
+    """Each token goes to the experts its token id has in tid2eid, whichever stage the layer runs on."""
+    num_experts, topk, vocab, batch, sequence = 16, 6, 40, 2, 5
+    generator = torch.Generator().manual_seed(0)
+    table = torch.stack(
+        [torch.randperm(num_experts, generator=generator)[:topk] for _ in range(vocab)]
+    ).to(torch.int32)
+    router = TopKRouter.__new__(TopKRouter)
+    torch.nn.Module.__init__(router)
+    router.score_function = "sqrtsoftplus"
+    router.topk = topk
+    router.num_experts = num_experts
+    router.router_replay = None
+    router.config = SimpleNamespace(
+        moe_router_force_load_balancing=False,
+        moe_router_force_biased=None,
+        moe_router_topk_scaling_factor=None,
+    )
+    router.tid2eid = table
+    input_ids = torch.randint(0, vocab, (batch, sequence), generator=generator)
+    logits = torch.randn(sequence * batch, num_experts, generator=generator)
+
+    routing_probs, _ = router._hash_routing(logits, input_ids)
+
+    # Hidden states are sequence-major, [sequence, batch] flattened, whereas token ids are [batch, sequence].
+    for sequence_index in range(sequence):
+        for batch_index in range(batch):
+            row = sequence_index * batch + batch_index
+            expected = set(table[input_ids[batch_index, sequence_index]].tolist())
+            assert set(routing_probs[row].nonzero().flatten().tolist()) == expected
