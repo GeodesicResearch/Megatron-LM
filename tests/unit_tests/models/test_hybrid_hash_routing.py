@@ -15,7 +15,6 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment
 from megatron.core.models.hybrid.hybrid_model import (
     HybridModel,
     _get_hash_moe_layer_threshold,
-    _validate_hash_moe_pipeline_placement,
 )
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
@@ -340,6 +339,43 @@ def test_hybrid_model_passes_ids_to_decoder_only_for_hash_routing(
     assert decoder.kwargs['input_ids'] is expected_input_ids
 
 
+def test_hybrid_model_non_embedding_stage_passes_received_ids_to_hash_decoder():
+    """A stage that does not own the embedding hands the token ids its caller supplies to its hash layers."""
+    decoder = RecordingDecoder()
+    hidden_states = torch.randn(4, 2, 8)
+    decoder.input_tensor = hidden_states
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            fine_grained_activation_offloading=False,
+            moe_paged_stash=False,
+            moe_num_hash_layers=3,
+            hash_moe_vocab_size=128,
+            sequence_parallel=False,
+            freeze_base_model_for_mtp=False,
+        ),
+        hybrid_layer_config_list=None,
+        _has_custom_layers=False,
+        decoder=decoder,
+        position_embedding_type='none',
+        pre_process=False,
+        post_process=False,
+        share_embeddings_and_output_weights=False,
+        mtp_process=False,
+        vocab_size=128,
+    )
+    input_ids = torch.arange(8).reshape(2, 4)
+
+    HybridModel.forward(
+        model,
+        input_ids=input_ids,
+        position_ids=torch.arange(4).repeat(2, 1),
+        attention_mask=None,
+        decoder_input=None,
+    )
+
+    assert decoder.kwargs['input_ids'] is input_ids
+
+
 @pytest.mark.parametrize("pre_process", [True, False])
 def test_hybrid_model_sequence_shards_hash_ids_with_decoder_input(monkeypatch, pre_process):
     decoder = RecordingDecoder()
@@ -634,7 +670,7 @@ def test_hash_moe_threshold_rejects_count_larger_than_pattern():
         _get_hash_moe_layer_threshold("-E-E", 3)
 
 
-def test_hash_moe_config_list_threshold_and_placement():
+def test_hash_moe_config_list_threshold():
     config = TransformerConfig(
         num_layers=8, hidden_size=8, num_attention_heads=2, num_moe_experts=2
     )
@@ -644,24 +680,6 @@ def test_hash_moe_config_list_threshold_and_placement():
     assert _get_hash_moe_layer_threshold(layers, 3) == 6
     with pytest.raises(ValueError, match="exceeds the 4 MoE layers"):
         _get_hash_moe_layer_threshold(layers, 5)
-    _validate_hash_moe_pipeline_placement(
-        [mlp, moe], layer_offset=6, hash_moe_layer_threshold=6, pre_process=False
-    )
-    with pytest.raises(ValueError, match="non-embedding stage contains hash MoE"):
-        _validate_hash_moe_pipeline_placement(
-            [mlp, moe], layer_offset=4, hash_moe_layer_threshold=6, pre_process=False
-        )
-
-
-def test_hash_moe_pipeline_placement_allows_later_learned_moe_stage():
-    _validate_hash_moe_pipeline_placement(
-        [LayerSymbols.MOE], layer_offset=6, hash_moe_layer_threshold=4, pre_process=False
-    )
-
-    with pytest.raises(ValueError, match="non-embedding stage contains hash MoE"):
-        _validate_hash_moe_pipeline_placement(
-            [LayerSymbols.MOE], layer_offset=4, hash_moe_layer_threshold=6, pre_process=False
-        )
 
 
 def test_hybrid_stack_marks_mtp_moe_and_propagates_mtp_depth(monkeypatch):

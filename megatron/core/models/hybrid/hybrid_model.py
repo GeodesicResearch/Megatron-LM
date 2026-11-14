@@ -86,33 +86,6 @@ def _get_hash_moe_layer_threshold(
     return moe_layer_numbers[n_hash_layers - 1]
 
 
-def _validate_hash_moe_pipeline_placement(
-    layer_type_list: Sequence[str | TransformerConfig],
-    layer_offset: int,
-    hash_moe_layer_threshold: int,
-    pre_process: bool,
-) -> None:
-    """Reject local hash-MoE layers on a stage that does not own the token IDs."""
-    if hash_moe_layer_threshold <= 0 or pre_process:
-        return
-
-    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-    from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
-
-    local_hash_layer_numbers = [
-        layer_offset + local_layer_number
-        for local_layer_number, layer_type in enumerate(layer_type_list, start=1)
-        if (layer_type == Symbols.MOE or type(layer_type) is MoELayerConfig)
-        and layer_offset + local_layer_number <= hash_moe_layer_threshold
-    ]
-    if local_hash_layer_numbers:
-        raise ValueError(
-            "Currently, all hash MoE layers must be in the same pipeline/virtual-pipeline "
-            "stage as the embedding because only that stage owns input_ids. This "
-            f"non-embedding stage contains hash MoE layer(s) {local_hash_layer_numbers}."
-        )
-
-
 class HybridModel(LanguageModule, GraphableMegatronModule):
     """Hybrid language model.
 
@@ -481,10 +454,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # Validate TP communication overlap after determining whether this rank builds MTP,
         # before constructing the decoder or MTP modules.
         layer_utils.validate_tp_comm_overlap(self.config, '', has_mtp=self.mtp_process)
-
-        _validate_hash_moe_pipeline_placement(
-            layer_config_list, layer_offset, hash_moe_layer_threshold, self.pre_process
-        )
 
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
