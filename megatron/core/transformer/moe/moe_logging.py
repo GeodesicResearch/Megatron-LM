@@ -38,6 +38,10 @@ class MetricEntry:
     reduce_group: Optional[torch.distributed.ProcessGroup] = None
     avg_group: Optional[torch.distributed.ProcessGroup] = None
     needs_dp_avg: bool = True
+    # True for an entry that ensure_initialized() pre-created on a rank that recorded nothing.
+    # Its zeros take the length that the recording pipeline ranks use before the pipeline
+    # reduction, and a later record() replaces it.
+    placeholder: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +122,7 @@ class MoEMetricsTracker:
         if layer_number is None:
             return
 
-        if name not in self._metrics:
+        if name not in self._metrics or self._metrics[name].placeholder:
             self._metrics[name] = MetricEntry(values=torch.zeros(num_layers, device=value.device))
 
         entry = self._metrics[name]
@@ -232,7 +236,9 @@ class MoEMetricsTracker:
         if name not in self._metrics:
             if device is None:
                 device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
-            self._metrics[name] = MetricEntry(values=torch.zeros(num_layers, device=device))
+            self._metrics[name] = MetricEntry(
+                values=torch.zeros(num_layers, device=device), placeholder=True
+            )
 
     # =========================================================================
     # Private implementation
@@ -267,6 +273,7 @@ class MoEMetricsTracker:
                 continue
 
             entry = self._metrics[name]
+            self._match_pipeline_length(name, entry, pp_group)
             v = entry.values
 
             torch.distributed.all_reduce(v, group=pp_group)
@@ -281,6 +288,41 @@ class MoEMetricsTracker:
 
             if entry.needs_dp_avg:
                 torch.distributed.all_reduce(v, group=dp_group, op=torch.distributed.ReduceOp.AVG)
+
+    @staticmethod
+    def _match_pipeline_length(
+        name: str, entry: MetricEntry, pp_group: torch.distributed.ProcessGroup
+    ) -> None:
+        """Give a placeholder the recording ranks' length before the pipeline all-reduce.
+
+        A recording rank sizes its tensor by the model's layer count, while a rank with no MoE
+        layer pre-creates its placeholder from the ``num_layers`` passed to ``report()``. For a
+        hybrid model the callers pass the MoE-layer count there (the divisor of the mean), so the
+        two lengths differ and the all-reduce never completes. The ranks agree on the longest
+        length; a placeholder takes it, and a recorded entry of another length is an error on
+        every rank.
+        """
+        lengths = torch.tensor(
+            [entry.values.numel(), 0 if entry.placeholder else entry.values.numel()],
+            dtype=torch.int64,
+            device=entry.values.device,
+        )
+        torch.distributed.all_reduce(lengths, op=torch.distributed.ReduceOp.MAX, group=pp_group)
+        longest, longest_recorded = int(lengths[0]), int(lengths[1])
+        mismatch = torch.tensor(
+            [int(not entry.placeholder and entry.values.numel() != longest_recorded)],
+            dtype=torch.int64,
+            device=entry.values.device,
+        )
+        torch.distributed.all_reduce(mismatch, op=torch.distributed.ReduceOp.MAX, group=pp_group)
+        if int(mismatch[0]):
+            raise RuntimeError(
+                f"MoE metric {name!r}: pipeline ranks recorded it with different num_layers "
+                f"(this rank {entry.values.numel()}, longest {longest_recorded})"
+            )
+        target = longest_recorded if longest_recorded else longest
+        if entry.placeholder and entry.values.numel() != target:
+            entry.values = torch.zeros(target, device=entry.values.device)
 
     @staticmethod
     def _count_moe_layers(
